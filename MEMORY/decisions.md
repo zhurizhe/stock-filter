@@ -87,3 +87,26 @@
 
 ### Follow-up
 - decide whether `3`-point names should be exported as a separate watchlist by default
+
+## 2026-03-11
+
+### Change Class
+- C
+
+### Decision
+- add a separate `volume contraction quality` scorer, reuse the same breakout/pullback context as pullback-quality, and change the live screener to score `2 + 2 + 2` while defaulting to `>=5`
+
+### Why
+- the user wants缩量质量单独记 2 分，并要求用回踩阶段平均量对比 `vol20`
+- “假缩量”需要结合 `turnover_rate` 和回踩阶段日均成交额判断，批量脚本必须补拉 `daily_basic`
+- shared context keeps breakout / swing-high / pullback detection consistent across the two pullback-related scorers
+
+### Rollback
+- remove `evaluate_volume_contraction_quality()`, inline the old pullback-only context in `scripts/stock_filter.py`, revert `scripts/run_stock_filter.py` to `2 + 2`, and revert this decision entry
+
+### Impact
+- live screening now distinguishes真实缩量、可接受缩量、以及弱缩量/流动性衰减
+- default output can retain one degraded dimension by keeping `>=5` instead of forcing a perfect `6`
+
+### Follow-up
+- decide whether `raw_grade` and downgraded grade should both be exported in CSV by default

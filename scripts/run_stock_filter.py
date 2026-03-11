@@ -6,10 +6,18 @@ from datetime import date
 import pandas as pd
 
 try:
-    from .stock_filter import evaluate_pullback_quality, evaluate_strong_background
+    from .stock_filter import (
+        evaluate_pullback_quality,
+        evaluate_strong_background,
+        evaluate_volume_contraction_quality,
+    )
     from .tushare_common import emit_dataframe, get_pro_client
 except ImportError:
-    from stock_filter import evaluate_pullback_quality, evaluate_strong_background
+    from stock_filter import (
+        evaluate_pullback_quality,
+        evaluate_strong_background,
+        evaluate_volume_contraction_quality,
+    )
     from tushare_common import emit_dataframe, get_pro_client
 
 
@@ -19,10 +27,17 @@ RESULT_COLUMNS = [
     "trade_date",
     "strong_background_score",
     "pullback_quality_score",
+    "volume_contraction_score",
     "total_score",
     "pullback_quality_grade",
+    "volume_contraction_grade",
     "pullback_days",
     "pullback_ratio",
+    "pullback_vol_mean",
+    "pullback_vol_ratio",
+    "pullback_turnover_rate_mean",
+    "pullback_avg_amount_yuan",
+    "liquidity_warning",
     "breakout_trade_date",
     "swing_high_trade_date",
     "close",
@@ -41,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=int, default=20, help="Recent trading days to evaluate.")
     parser.add_argument("--limit", type=int, default=50, help="Rows to print when not saving.")
     parser.add_argument("--output", help="Optional CSV output path.")
-    parser.add_argument("--min-score", type=int, default=4, help="Minimum total score to keep.")
+    parser.add_argument("--min-score", type=int, default=5, help="Minimum total score to keep.")
     parser.add_argument(
         "--negative-announcements",
         help="Optional CSV with ts_code and trade_date columns.",
@@ -94,12 +109,26 @@ def fetch_daily_window(pro, trade_dates: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def fetch_daily_basic_window(pro, trade_dates: list[str]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for trade_date in trade_dates:
+        frame = pro.daily_basic(
+            trade_date=trade_date,
+            fields="ts_code,trade_date,turnover_rate",
+        )
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        raise SystemExit("No daily_basic rows returned for the requested window.")
+    return pd.concat(frames, ignore_index=True).drop_duplicates(["ts_code", "trade_date"], keep="last")
+
+
 def screen_universe(
     pro,
     *,
     end_date: str,
     window: int,
-    min_score: int = 4,
+    min_score: int = 5,
     negative_announcement_map: dict[str, set[str]] | None = None,
     min_listing_days: int = 60,
 ) -> pd.DataFrame:
@@ -107,6 +136,8 @@ def screen_universe(
     history_window = window + 19
     trade_dates = get_recent_trade_dates(pro, end_date=end_date, window=history_window)
     daily_df = fetch_daily_window(pro, trade_dates)
+    daily_basic_df = fetch_daily_basic_window(pro, trade_dates)
+    daily_df = daily_df.merge(daily_basic_df, on=["ts_code", "trade_date"], how="left")
     available_trade_dates = sorted(daily_df["trade_date"].astype(str).unique().tolist())
     if len(available_trade_dates) < history_window:
         raise SystemExit(f"Only found {len(available_trade_dates)} available trade dates with daily data.")
@@ -128,9 +159,11 @@ def screen_universe(
             min_listing_days=min_listing_days,
         )
         pullback_result = evaluate_pullback_quality(group, recent_window=window)
+        volume_result = evaluate_volume_contraction_quality(group, recent_window=window)
         strong_background_score = int(strong_result.get("score", 0))
         pullback_quality_score = int(pullback_result.get("score", 0))
-        total_score = strong_background_score + pullback_quality_score
+        volume_contraction_score = int(volume_result.get("score", 0))
+        total_score = strong_background_score + pullback_quality_score + volume_contraction_score
         if total_score < min_score:
             continue
         results.append(
@@ -140,12 +173,19 @@ def screen_universe(
                 "trade_date": strong_result["trade_date"],
                 "strong_background_score": strong_background_score,
                 "pullback_quality_score": pullback_quality_score,
+                "volume_contraction_score": volume_contraction_score,
                 "total_score": total_score,
-                "pullback_quality_grade": pullback_result["grade"],
-                "pullback_days": pullback_result["pullback_days"],
-                "pullback_ratio": pullback_result["pullback_ratio"],
-                "breakout_trade_date": pullback_result["breakout_trade_date"],
-                "swing_high_trade_date": pullback_result["swing_high_trade_date"],
+                "pullback_quality_grade": pullback_result.get("grade"),
+                "volume_contraction_grade": volume_result.get("grade"),
+                "pullback_days": pullback_result.get("pullback_days"),
+                "pullback_ratio": pullback_result.get("pullback_ratio"),
+                "pullback_vol_mean": volume_result.get("pullback_vol_mean"),
+                "pullback_vol_ratio": volume_result.get("pullback_vol_ratio"),
+                "pullback_turnover_rate_mean": volume_result.get("pullback_turnover_rate_mean"),
+                "pullback_avg_amount_yuan": volume_result.get("pullback_avg_amount_yuan"),
+                "liquidity_warning": volume_result.get("liquidity_warning"),
+                "breakout_trade_date": pullback_result.get("breakout_trade_date"),
+                "swing_high_trade_date": pullback_result.get("swing_high_trade_date"),
                 "close": strong_result["close"],
                 "ma10": strong_result["ma10"],
                 "ma20": strong_result["ma20"],
@@ -160,8 +200,15 @@ def screen_universe(
         return pd.DataFrame(columns=RESULT_COLUMNS)
 
     return pd.DataFrame(results).sort_values(
-        ["total_score", "pullback_quality_score", "max_runup_pct_20", "max_vol_ratio_20", "avg_amount_yuan_20"],
-        ascending=[False, False, False, False, False],
+        [
+            "total_score",
+            "volume_contraction_score",
+            "pullback_quality_score",
+            "max_runup_pct_20",
+            "max_vol_ratio_20",
+            "avg_amount_yuan_20",
+        ],
+        ascending=[False, False, False, False, False, False],
     )
 
 

@@ -74,6 +74,118 @@ def _pullback_score(grade: str) -> int:
     return 0
 
 
+def _downgrade_grade(grade: str) -> str:
+    if grade == PASS_GRADE:
+        return DEGRADED_GRADE
+    if grade == DEGRADED_GRADE:
+        return EXCLUDED_GRADE
+    return grade
+
+
+def _grade_volume_contraction(pullback_vol_mean: float, vol20: float) -> str:
+    if vol20 <= 0:
+        return EXCLUDED_GRADE
+    contraction_ratio = pullback_vol_mean / vol20
+    if contraction_ratio <= 0.7:
+        return PASS_GRADE
+    if contraction_ratio <= 0.9:
+        return DEGRADED_GRADE
+    return EXCLUDED_GRADE
+
+
+def _build_pullback_context(
+    daily_df: pd.DataFrame,
+    *,
+    recent_window: int,
+    breakout_volume_ratio: float,
+    required_columns: set[str] | None = None,
+    numeric_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    required = {"trade_date", "close", "high", "low", "vol"}
+    if required_columns:
+        required |= required_columns
+    numeric = ["close", "high", "low", "vol"]
+    if numeric_columns:
+        numeric.extend(numeric_columns)
+    frame = _prepare_price_frame(
+        daily_df,
+        required_columns=required,
+        numeric_columns=list(dict.fromkeys(numeric)),
+    )
+
+    if len(frame) < recent_window:
+        return {
+            "ok": False,
+            "error": f"Need at least {recent_window} trading days.",
+            "checks": {"enough_history": False},
+        }
+
+    frame["ma20_series"] = frame["close"].rolling(20, min_periods=20).mean()
+    frame["vol20_series"] = frame["vol"].rolling(20, min_periods=20).mean()
+    frame["pct_change"] = frame["close"].pct_change()
+
+    recent = frame.tail(recent_window).copy().reset_index(drop=True)
+    recent["prior_high"] = recent["high"].cummax().shift(1)
+    vol20 = float(recent["vol"].mean())
+    breakout_mask = (
+        recent["prior_high"].notna()
+        & (recent["high"] > recent["prior_high"])
+        & (recent["vol"] >= breakout_volume_ratio * vol20)
+    )
+
+    if not breakout_mask.any():
+        return {
+            "ok": False,
+            "error": "No recent volume breakout found.",
+            "checks": {
+                "enough_history": True,
+                "has_breakout": False,
+            },
+        }
+
+    breakout_pos = int(recent.index[breakout_mask][-1])
+    breakout_row = recent.loc[breakout_pos]
+    breakout_trade_date = breakout_row["trade_date"]
+    breakout_low = float(breakout_row["low"])
+
+    swing_window = recent.loc[breakout_pos:].copy()
+    swing_high_pos = int(swing_window["high"].idxmax())
+    swing_high_row = recent.loc[swing_high_pos]
+    swing_high_trade_date = swing_high_row["trade_date"]
+    swing_high = float(swing_high_row["high"])
+
+    if swing_high <= breakout_low:
+        return {
+            "ok": False,
+            "error": "Invalid breakout range.",
+            "checks": {
+                "enough_history": True,
+                "has_breakout": True,
+            },
+        }
+
+    pullback_frame = frame[frame["trade_date"] > swing_high_trade_date].copy().reset_index(drop=True)
+    pullback_days = int(len(pullback_frame))
+    pullback_low = swing_high if pullback_frame.empty else float(pullback_frame["low"].min())
+    pullback_ratio = float((swing_high - pullback_low) / (swing_high - breakout_low))
+
+    return {
+        "ok": True,
+        "frame": frame,
+        "recent": recent,
+        "trade_date": recent.iloc[-1]["trade_date"].strftime("%Y%m%d"),
+        "breakout_trade_date": breakout_trade_date.strftime("%Y%m%d"),
+        "swing_high_trade_date": swing_high_trade_date.strftime("%Y%m%d"),
+        "breakout_low": breakout_low,
+        "swing_high": swing_high,
+        "pullback_low": pullback_low,
+        "pullback_days": pullback_days,
+        "pullback_ratio": pullback_ratio,
+        "pullback_frame": pullback_frame,
+        "vol20": vol20,
+    }
+
+
 def evaluate_strong_background(
     daily_df: pd.DataFrame,
     *,
@@ -162,83 +274,28 @@ def evaluate_pullback_quality(
     recent_window: int = 20,
     breakout_volume_ratio: float = 1.5,
 ) -> dict[str, Any]:
-    frame = _prepare_price_frame(
+    context = _build_pullback_context(
         daily_df,
-        required_columns={"trade_date", "close", "high", "low", "vol"},
-        numeric_columns=["close", "high", "low", "vol"],
+        recent_window=recent_window,
+        breakout_volume_ratio=breakout_volume_ratio,
     )
 
-    if len(frame) < recent_window:
+    if not context["ok"]:
         return {
             "passed": False,
             "grade": EXCLUDED_GRADE,
             "score": 0,
-            "error": f"Need at least {recent_window} trading days.",
-            "checks": {"enough_history": False},
+            "error": context["error"],
+            "checks": context["checks"],
         }
 
-    frame["ma20_series"] = frame["close"].rolling(20, min_periods=20).mean()
-    frame["vol20_series"] = frame["vol"].rolling(20, min_periods=20).mean()
-    frame["pct_change"] = frame["close"].pct_change()
-
-    recent = frame.tail(recent_window).copy().reset_index(drop=True)
-    recent["prior_high"] = recent["high"].cummax().shift(1)
-    recent_vol20 = float(recent["vol"].mean())
-    breakout_mask = (
-        recent["prior_high"].notna()
-        & (recent["high"] > recent["prior_high"])
-        & (recent["vol"] >= breakout_volume_ratio * recent_vol20)
-    )
-
-    if not breakout_mask.any():
-        return {
-            "passed": False,
-            "grade": EXCLUDED_GRADE,
-            "score": 0,
-            "error": "No recent volume breakout found.",
-            "checks": {
-                "enough_history": True,
-                "has_breakout": False,
-                "duration_ok": False,
-                "depth_ok": False,
-                "ma20_intact": True,
-            },
-        }
-
-    breakout_pos = int(recent.index[breakout_mask][-1])
-    breakout_row = recent.loc[breakout_pos]
-    breakout_trade_date = breakout_row["trade_date"]
-    breakout_low = float(breakout_row["low"])
-
-    swing_window = recent.loc[breakout_pos:].copy()
-    swing_high_pos = int(swing_window["high"].idxmax())
-    swing_high_row = recent.loc[swing_high_pos]
-    swing_high_trade_date = swing_high_row["trade_date"]
-    swing_high = float(swing_high_row["high"])
-
-    if swing_high <= breakout_low:
-        return {
-            "passed": False,
-            "grade": EXCLUDED_GRADE,
-            "score": 0,
-            "error": "Invalid breakout range.",
-            "checks": {
-                "enough_history": True,
-                "has_breakout": True,
-                "duration_ok": False,
-                "depth_ok": False,
-                "ma20_intact": True,
-            },
-        }
-
-    pullback_slice = recent.loc[swing_high_pos + 1 :].copy()
-    pullback_days = int(len(pullback_slice))
-    pullback_low = swing_high if pullback_slice.empty else float(pullback_slice["low"].min())
-    pullback_ratio = float((swing_high - pullback_low) / (swing_high - breakout_low))
+    frame = context["frame"]
+    pullback_days = int(context["pullback_days"])
+    pullback_ratio = float(context["pullback_ratio"])
     duration_grade = _grade_pullback_duration(pullback_days)
     depth_grade = _grade_pullback_depth(pullback_ratio)
 
-    pullback_frame = frame[frame["trade_date"] > swing_high_trade_date].copy()
+    pullback_frame = context["pullback_frame"].copy()
     below_ma20 = (pullback_frame["close"] < pullback_frame["ma20_series"]).fillna(False)
     consecutive_below_ma20 = bool((below_ma20 & below_ma20.shift(1, fill_value=False)).any())
     sharp_break_mask = (
@@ -271,15 +328,94 @@ def evaluate_pullback_quality(
         "passed": grade == PASS_GRADE,
         "grade": grade,
         "score": _pullback_score(grade),
-        "trade_date": recent.iloc[-1]["trade_date"].strftime("%Y%m%d"),
-        "breakout_trade_date": breakout_trade_date.strftime("%Y%m%d"),
-        "swing_high_trade_date": swing_high_trade_date.strftime("%Y%m%d"),
-        "breakout_low": breakout_low,
-        "swing_high": swing_high,
-        "pullback_low": pullback_low,
+        "trade_date": context["trade_date"],
+        "breakout_trade_date": context["breakout_trade_date"],
+        "swing_high_trade_date": context["swing_high_trade_date"],
+        "breakout_low": context["breakout_low"],
+        "swing_high": context["swing_high"],
+        "pullback_low": context["pullback_low"],
         "pullback_days": pullback_days,
         "pullback_ratio": pullback_ratio,
         "ma20_broken": ma20_broken,
+        "checks": checks,
+    }
+
+
+def evaluate_volume_contraction_quality(
+    daily_df: pd.DataFrame,
+    *,
+    recent_window: int = 20,
+    breakout_volume_ratio: float = 1.5,
+    min_turnover_rate: float = 1.0,
+    min_avg_amount_yuan: float = 500_000_000,
+) -> dict[str, Any]:
+    context = _build_pullback_context(
+        daily_df,
+        recent_window=recent_window,
+        breakout_volume_ratio=breakout_volume_ratio,
+        required_columns={"amount", "turnover_rate"},
+        numeric_columns=["amount", "turnover_rate"],
+    )
+
+    if not context["ok"]:
+        return {
+            "passed": False,
+            "grade": EXCLUDED_GRADE,
+            "score": 0,
+            "error": context["error"],
+            "checks": context["checks"],
+        }
+
+    pullback_frame = context["pullback_frame"].copy()
+    if pullback_frame.empty:
+        return {
+            "passed": False,
+            "grade": WAITING_GRADE,
+            "score": 0,
+            "error": "Pullback not started.",
+            "checks": {
+                "enough_history": True,
+                "has_breakout": True,
+                "has_pullback": False,
+            },
+        }
+
+    vol20 = float(context["vol20"])
+    pullback_vol_mean = float(pullback_frame["vol"].mean())
+    pullback_vol_ratio = pullback_vol_mean / vol20 if vol20 > 0 else 0.0
+    raw_grade = _grade_volume_contraction(pullback_vol_mean, vol20)
+    pullback_turnover_rate_mean = float(pullback_frame["turnover_rate"].mean())
+    pullback_avg_amount_yuan = float(pullback_frame["amount"].mean() * AMOUNT_UNIT_YUAN)
+    liquidity_warning = (
+        pullback_turnover_rate_mean < min_turnover_rate
+        and pullback_avg_amount_yuan < min_avg_amount_yuan
+    )
+    grade = _downgrade_grade(raw_grade) if liquidity_warning else raw_grade
+
+    checks = {
+        "enough_history": True,
+        "has_breakout": True,
+        "has_pullback": True,
+        "volume_contraction_strong": raw_grade == PASS_GRADE,
+        "volume_contraction_acceptable": raw_grade in {PASS_GRADE, DEGRADED_GRADE},
+        "liquidity_ok": not liquidity_warning,
+    }
+
+    return {
+        "passed": grade == PASS_GRADE,
+        "grade": grade,
+        "score": _pullback_score(grade),
+        "trade_date": context["trade_date"],
+        "breakout_trade_date": context["breakout_trade_date"],
+        "swing_high_trade_date": context["swing_high_trade_date"],
+        "pullback_days": context["pullback_days"],
+        "pullback_vol_mean": pullback_vol_mean,
+        "pullback_vol_ratio": pullback_vol_ratio,
+        "pullback_turnover_rate_mean": pullback_turnover_rate_mean,
+        "pullback_avg_amount_yuan": pullback_avg_amount_yuan,
+        "vol20": vol20,
+        "raw_grade": raw_grade,
+        "liquidity_warning": liquidity_warning,
         "checks": checks,
     }
 

@@ -8,3 +8,5 @@
 - local environment note: system Python is externally managed under PEP 668, so dependency validation now uses repo-local `.venv`
 - live-run issue found and fixed: `trade_cal` included 20260311 intraday before full `daily` rows were available, so the screener now trims to the latest complete 20-date window
 - live result note: after adding pullback-quality scoring, the 4-point live run returned 0 names; this appears to be rule strictness, not a runtime error
+- live result note: after adding volume-contraction scoring and the `>=5` default threshold, the 2026-03-11 live run also returned 0 names; this appears to be rule strictness, not a runtime error
+- data dependency note: volume-contraction scoring now depends on `daily_basic.turnover_rate`; symbols missing that field in the pulled window will lose volume-score eligibility

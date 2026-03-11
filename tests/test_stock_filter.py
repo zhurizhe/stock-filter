@@ -4,7 +4,11 @@ import unittest
 
 import pandas as pd
 
-from scripts.stock_filter import evaluate_pullback_quality, evaluate_stock_filter
+from scripts.stock_filter import (
+    evaluate_pullback_quality,
+    evaluate_stock_filter,
+    evaluate_volume_contraction_quality,
+)
 
 
 def make_daily_frame() -> pd.DataFrame:
@@ -30,6 +34,8 @@ def make_pullback_frame(
     final_lows: list[float],
     final_closes: list[float] | None = None,
     final_volumes: list[float] | None = None,
+    final_amounts: list[float] | None = None,
+    final_turnover_rates: list[float] | None = None,
 ) -> pd.DataFrame:
     dates = pd.bdate_range("2025-01-02", periods=40)
     rows = []
@@ -44,7 +50,8 @@ def make_pullback_frame(
                 "low": close - 0.12,
                 "close": close,
                 "vol": 1000,
-                "amount": 400000,
+                "amount": 600000,
+                "turnover_rate": 2.0,
             }
         )
 
@@ -76,12 +83,15 @@ def make_pullback_frame(
                 "low": low,
                 "close": close,
                 "vol": vol,
-                "amount": 400000,
+                "amount": 600000,
+                "turnover_rate": 2.0,
             }
         )
 
     final_closes = final_closes or [13.60, 13.40, 13.20, 13.05, 13.00]
     final_volumes = final_volumes or [1150, 1120, 1100, 1080, 1050]
+    final_amounts = final_amounts or [600000, 600000, 600000, 600000, 600000]
+    final_turnover_rates = final_turnover_rates or [2.0, 2.0, 2.0, 2.0, 2.0]
 
     for offset, low in enumerate(final_lows, start=35):
         close = final_closes[offset - 35]
@@ -93,7 +103,8 @@ def make_pullback_frame(
                 "low": low,
                 "close": close,
                 "vol": final_volumes[offset - 35],
-                "amount": 400000,
+                "amount": final_amounts[offset - 35],
+                "turnover_rate": final_turnover_rates[offset - 35],
             }
         )
 
@@ -155,6 +166,43 @@ class StockFilterTest(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["grade"], "excluded")
         self.assertFalse(result["checks"]["ma20_intact"])
+
+    def test_volume_contraction_quality_passes(self) -> None:
+        result = evaluate_volume_contraction_quality(
+            make_pullback_frame(
+                final_lows=[13.9, 13.8, 13.6, 13.4, 13.2],
+                final_volumes=[760, 740, 720, 700, 680],
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["grade"], "pass")
+        self.assertEqual(result["score"], 2)
+
+    def test_volume_contraction_quality_degrades_on_ratio(self) -> None:
+        result = evaluate_volume_contraction_quality(
+            make_pullback_frame(
+                final_lows=[13.9, 13.8, 13.6, 13.4, 13.2],
+                final_volumes=[1040, 1020, 1000, 980, 960],
+            )
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["grade"], "degraded")
+        self.assertEqual(result["score"], 1)
+        self.assertTrue(result["checks"]["volume_contraction_acceptable"])
+
+    def test_volume_contraction_quality_downgrades_fake_contraction(self) -> None:
+        result = evaluate_volume_contraction_quality(
+            make_pullback_frame(
+                final_lows=[13.9, 13.8, 13.6, 13.4, 13.2],
+                final_volumes=[760, 740, 720, 700, 680],
+                final_amounts=[400000, 400000, 400000, 400000, 400000],
+                final_turnover_rates=[0.8, 0.8, 0.8, 0.8, 0.8],
+            )
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["grade"], "degraded")
+        self.assertEqual(result["score"], 1)
+        self.assertTrue(result["liquidity_warning"])
 
 
 if __name__ == "__main__":
